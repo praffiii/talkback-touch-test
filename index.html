@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TalkBack Touch Test</title>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; overflow: hidden; overscroll-behavior: none; }
+  body {
+    display: flex; flex-direction: column; height: 100dvh;
+    background: #101418; color: #e8edf2;
+    font: 15px/1.35 system-ui, sans-serif;
+  }
+  #panel { padding: 12px 16px; display: grid; gap: 10px; }
+  #buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  button {
+    min-height: 48px; padding: 0 8px; border: 0; border-radius: 10px;
+    background: #2a3440; color: inherit; font: inherit; font-weight: 600;
+  }
+  #start { background: #3ddc97; color: #06281a; }
+  #counts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  #counts div { background: #1a2129; border-radius: 8px; padding: 4px 6px; font-size: 12px; }
+  #counts b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  #counts .hit { outline: 2px solid #3ddc97; }
+  #status { font-size: 13px; color: #a9b6c3; }
+  #area { flex: 1; position: relative; touch-action: none; user-select: none; -webkit-user-select: none; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+  <div id="panel">
+    <div id="buttons">
+      <button id="start" type="button">Start sound</button>
+      <button id="usePhoto" type="button">Use photo</button>
+      <input id="file" type="file" accept="image/*" hidden>
+      <button id="mode" type="button">Mode: plain</button>
+      <button id="reset" type="button">Reset</button>
+    </div>
+    <div id="counts"></div>
+    <p id="status">Tap Start sound, then drag a finger across the graph.</p>
+  </div>
+  <div id="area"><canvas id="graph" aria-hidden="true"></canvas></div>
+
+<script>
+  const area = document.getElementById("area");
+  const canvas = document.getElementById("graph");
+  const statusEl = document.getElementById("status");
+  const countsEl = document.getElementById("counts");
+  const modeBtn = document.getElementById("mode");
+
+  const EVENTS = ["pointerdown", "pointermove", "pointercancel", "touchstart", "touchmove", "mousemove", "click"];
+  const LINE_TOLERANCE = 0.06;
+  const MASK_WIDTH = 256;      // ink is detected on a small copy of the photo
+  const BACKGROUND_RADIUS = 12;
+  const INK_CONTRAST = 0.12;   // how far a pixel must differ from its surroundings
+  const MIN_BLOB = 12;         // smaller specks are treated as noise
+  const FINGER_RADIUS = 4;     // in mask pixels
+
+  const curve = (x) => 0.5 + 0.35 * Math.sin(x * Math.PI * 2);
+
+  let photo = null;            // { bitmap, mask, rect }
+
+  function buildInkMask(bitmap) {
+    const w = MASK_WIDTH;
+    const h = Math.round(bitmap.height * w / bitmap.width);
+    const small = document.createElement("canvas");
+    small.width = w;
+    small.height = h;
+    const pen = small.getContext("2d", { willReadFrequently: true });
+    pen.drawImage(bitmap, 0, 0, w, h);
+    const pixels = pen.getImageData(0, 0, w, h).data;
+
+    const gray = new Float32Array(w * h);
+    let total = 0;
+    for (let i = 0; i < gray.length; i++) {
+      gray[i] = (pixels[i * 4] * 0.3 + pixels[i * 4 + 1] * 0.59 + pixels[i * 4 + 2] * 0.11) / 255;
+      total += gray[i];
+    }
+    const darkBoard = total / gray.length < 0.4;   // blackboard: chalk is lighter than its surroundings
+
+    const stride = w + 1;
+    const sums = new Float64Array(stride * (h + 1));
+    for (let y = 0; y < h; y++) {
+      let row = 0;
+      for (let x = 0; x < w; x++) {
+        row += gray[y * w + x];
+        sums[(y + 1) * stride + x + 1] = sums[y * stride + x + 1] + row;
+      }
+    }
+
+    const ink = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const top = Math.max(0, y - BACKGROUND_RADIUS);
+      const bottom = Math.min(h, y + BACKGROUND_RADIUS + 1);
+      for (let x = 0; x < w; x++) {
+        const left = Math.max(0, x - BACKGROUND_RADIUS);
+        const right = Math.min(w, x + BACKGROUND_RADIUS + 1);
+        const area = (bottom - top) * (right - left);
+        const mean = (sums[bottom * stride + right] - sums[top * stride + right]
+          - sums[bottom * stride + left] + sums[top * stride + left]) / area;
+        const contrast = darkBoard ? gray[y * w + x] - mean : mean - gray[y * w + x];
+        ink[y * w + x] = contrast > INK_CONTRAST ? 1 : 0;
+      }
+    }
+    dropSpecks(ink, w, h);
+    return { ink, w, h, darkBoard };
+  }
+
+  function dropSpecks(ink, w, h) {
+    const seen = new Uint8Array(ink.length);
+    for (let start = 0; start < ink.length; start++) {
+      if (!ink[start] || seen[start]) continue;
+      const blob = [start];
+      seen[start] = 1;
+      for (let i = 0; i < blob.length; i++) {
+        const at = blob[i];
+        const x = at % w;
+        const neighbours = [x > 0 ? at - 1 : -1, x < w - 1 ? at + 1 : -1, at - w, at + w];
+        for (const next of neighbours) {
+          if (next >= 0 && next < ink.length && ink[next] && !seen[next]) {
+            seen[next] = 1;
+            blob.push(next);
+          }
+        }
+      }
+      if (blob.length < MIN_BLOB) for (const at of blob) ink[at] = 0;
+    }
+  }
+
+  function onInk(clientX, clientY) {
+    const box = area.getBoundingClientRect();
+    const { mask, rect } = photo;
+    const mx = Math.round((clientX - box.left - rect.x) / rect.w * mask.w);
+    const my = Math.round((clientY - box.top - rect.y) / rect.h * mask.h);
+    for (let dy = -FINGER_RADIUS; dy <= FINGER_RADIUS; dy++) {
+      for (let dx = -FINGER_RADIUS; dx <= FINGER_RADIUS; dx++) {
+        const x = mx + dx;
+        const y = my + dy;
+        if (x >= 0 && y >= 0 && x < mask.w && y < mask.h && mask.ink[y * mask.w + x]) return true;
+      }
+    }
+    return false;
+  }
+
+  const cells = {};
+  const counts = {};
+  for (const name of [...EVENTS, "maxFingers"]) {
+    const cell = document.createElement("div");
+    cell.innerHTML = `<b>0</b>${name}`;
+    countsEl.append(cell);
+    cells[name] = cell;
+    counts[name] = 0;
+  }
+  const show = (name) => {
+    cells[name].firstChild.textContent = counts[name];
+    cells[name].classList.toggle("hit", counts[name] > 0);
+  };
+
+  let audio = null;
+  function startAudio() {
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    audio = { ctx, osc, gain };
+    ctx.resume();
+    tone(0.3, 440);
+    setTimeout(() => tone(0), 200);
+    const vibrates = "vibrate" in navigator && navigator.vibrate(60);
+    statusEl.textContent = `Sound on. You should hear a beep. Vibration: ${vibrates ? "supported" : "not supported"}.`;
+  }
+
+  function tone(volume, frequency) {
+    if (!audio) return;
+    const now = audio.ctx.currentTime;
+    audio.gain.gain.setTargetAtTime(volume, now, 0.01);
+    if (frequency) audio.osc.frequency.setTargetAtTime(frequency, now, 0.01);
+  }
+
+  function probe(clientX, clientY) {
+    const box = area.getBoundingClientRect();
+    const x = (clientX - box.left) / box.width;
+    const y = 1 - (clientY - box.top) / box.height;
+    const onLine = photo ? onInk(clientX, clientY) : Math.abs(y - curve(x)) < LINE_TOLERANCE;
+    tone(onLine ? 0.3 : 0, 200 + y * 800);
+    if (onLine) navigator.vibrate?.(10);
+    statusEl.textContent = `x ${x.toFixed(2)}  y ${y.toFixed(2)}  ${onLine ? "ON the line" : "off the line"}`;
+  }
+
+  for (const name of EVENTS) {
+    area.addEventListener(name, (event) => {
+      counts[name]++;
+      show(name);
+      const fingers = event.touches?.length ?? 0;
+      if (fingers > counts.maxFingers) {
+        counts.maxFingers = fingers;
+        show("maxFingers");
+      }
+      const point = event.touches?.[0] ?? event;
+      if (name !== "pointercancel" && point.clientX !== undefined) probe(point.clientX, point.clientY);
+    }, { passive: true });
+  }
+  for (const name of ["pointerup", "pointercancel", "touchend", "touchcancel", "mouseleave"]) {
+    area.addEventListener(name, () => tone(0));
+  }
+
+  document.getElementById("start").addEventListener("click", () => { if (!audio) startAudio(); });
+
+  const fileInput = document.getElementById("file");
+  document.getElementById("usePhoto").addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+    statusEl.textContent = "Reading photo...";
+    const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+    const mask = buildInkMask(bitmap);
+    photo = { bitmap, mask, rect: null };
+    draw();
+    const inkShare = mask.ink.reduce((sum, value) => sum + value, 0) / mask.ink.length;
+    statusEl.textContent = `Ink covers ${(inkShare * 100).toFixed(1)}% of the photo (${mask.darkBoard ? "dark" : "light"} board). Green is what you can feel.`;
+  });
+
+  document.getElementById("reset").addEventListener("click", () => {
+    for (const name in counts) { counts[name] = 0; show(name); }
+    tone(0);
+    statusEl.textContent = "Counters reset.";
+  });
+
+  modeBtn.addEventListener("click", () => {
+    const isApp = area.getAttribute("role") === "application";
+    if (isApp) {
+      area.removeAttribute("role");
+      area.removeAttribute("aria-label");
+      area.removeAttribute("tabindex");
+    } else {
+      area.setAttribute("role", "application");
+      area.setAttribute("aria-label", "Test graph. Drag to explore.");
+      area.tabIndex = 0;
+    }
+    modeBtn.textContent = `Mode: ${isApp ? "plain" : "application"}`;
+  });
+
+  function draw() {
+    const scale = devicePixelRatio;
+    const { width, height } = area.getBoundingClientRect();
+    canvas.width = width * scale;
+    canvas.height = height * scale;
+    const pen = canvas.getContext("2d");
+    pen.scale(scale, scale);
+    if (photo) return drawPhoto(pen, width, height);
+    pen.strokeStyle = "#3a4654";
+    pen.lineWidth = 2;
+    pen.strokeRect(1, 1, width - 2, height - 2);
+    pen.strokeStyle = "#3ddc97";
+    pen.lineWidth = LINE_TOLERANCE * height * 2;
+    pen.globalAlpha = 0.25;
+    trace(pen, width, height);
+    pen.globalAlpha = 1;
+    pen.lineWidth = 3;
+    trace(pen, width, height);
+  }
+
+  function drawPhoto(pen, width, height) {
+    const { bitmap, mask } = photo;
+    const fit = Math.min(width / bitmap.width, height / bitmap.height);
+    const rect = { w: bitmap.width * fit, h: bitmap.height * fit };
+    rect.x = (width - rect.w) / 2;
+    rect.y = (height - rect.h) / 2;
+    photo.rect = rect;
+
+    pen.globalAlpha = 0.4;
+    pen.drawImage(bitmap, rect.x, rect.y, rect.w, rect.h);
+    pen.globalAlpha = 1;
+
+    const overlay = document.createElement("canvas");
+    overlay.width = mask.w;
+    overlay.height = mask.h;
+    const overlayPen = overlay.getContext("2d");
+    const image = overlayPen.createImageData(mask.w, mask.h);
+    mask.ink.forEach((value, i) => {
+      if (!value) return;
+      image.data.set([61, 220, 151, 255], i * 4);
+    });
+    overlayPen.putImageData(image, 0, 0);
+    pen.imageSmoothingEnabled = false;
+    pen.drawImage(overlay, rect.x, rect.y, rect.w, rect.h);
+  }
+
+  function trace(pen, width, height) {
+    pen.beginPath();
+    for (let px = 0; px <= width; px += 2) {
+      pen.lineTo(px, (1 - curve(px / width)) * height);
+    }
+    pen.stroke();
+  }
+
+  addEventListener("resize", draw);
+  draw();
+</script>
+</body>
+</html>
