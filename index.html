@@ -19,6 +19,7 @@
     background: #2a3440; color: inherit; font: inherit; font-weight: 600;
   }
   #start { background: #3ddc97; color: #06281a; }
+  #vibes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
   #counts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
   #counts div { background: #1a2129; border-radius: 8px; padding: 4px 6px; font-size: 12px; }
   #counts b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
@@ -36,6 +37,11 @@
       <input id="file" type="file" accept="image/*" hidden>
       <button id="mode" type="button">Mode: plain</button>
       <button id="reset" type="button">Reset</button>
+    </div>
+    <div id="vibes">
+      <button id="vibeA" type="button">Vibrate A</button>
+      <button id="vibeB" type="button">Vibrate B</button>
+      <button id="vibeC" type="button">Vibrate C</button>
     </div>
     <div id="counts"></div>
     <p id="status">Tap Start sound, then drag a finger across the graph.</p>
@@ -208,6 +214,26 @@
   }
 
   document.getElementById("start").addEventListener("click", () => { if (!audio) startAudio(); });
+
+  // A: one long buzz. B: what dragging does now. C: fewer, stronger pulses.
+  function vibrationReport(label, accepted) {
+    const browser = navigator.userAgent.match(/(SamsungBrowser|Firefox|Edg|OPR|Chrome)\/[\d.]+/)?.[0] ?? "unknown browser";
+    statusEl.textContent = `${label}: vibrate ${"vibrate" in navigator ? `returned ${accepted}` : "is missing"}. ${browser}.`;
+  }
+
+  function repeatPulse(label, pulse, every) {
+    const stopAt = performance.now() + 1500;
+    let accepted;
+    const timer = setInterval(() => {
+      accepted = navigator.vibrate?.(pulse);
+      vibrationReport(label, accepted);
+      if (performance.now() > stopAt) clearInterval(timer);
+    }, every);
+  }
+
+  document.getElementById("vibeA").addEventListener("click", () => vibrationReport("A", navigator.vibrate?.(400)));
+  document.getElementById("vibeB").addEventListener("click", () => repeatPulse("B", 10, 16));
+  document.getElementById("vibeC").addEventListener("click", () => repeatPulse("C", 40, 120));
 
   const fileInput = document.getElementById("file");
   document.getElementById("usePhoto").addEventListener("click", () => fileInput.click());
